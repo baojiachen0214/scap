@@ -108,6 +108,9 @@ struct MenuBarView: View {
                 cameraDeviceService: viewModel.cameraDeviceService
             )
 
+            // Audio Control Panel Entry
+            AudioControlPanelEntry(mixer: viewModel.audioMixer, settings: viewModel.settings)
+
             AudioSettingsSection(
                 settings: viewModel.settings,
                 audioDeviceService: viewModel.audioDeviceService

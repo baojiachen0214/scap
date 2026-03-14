@@ -294,6 +294,106 @@ final class SettingsStore {
         }
     }
 
+    // MARK: - Audio Mixer Settings
+
+    var systemAudioVolume: Float {
+        get {
+            access(keyPath: \.systemAudioVolume)
+            return UserDefaults.standard.float(forKey: "systemAudioVolume")
+        }
+        set {
+            withMutation(keyPath: \.systemAudioVolume) {
+                UserDefaults.standard.set(newValue, forKey: "systemAudioVolume")
+            }
+        }
+    }
+
+    var microphoneVolume: Float {
+        get {
+            access(keyPath: \.microphoneVolume)
+            return UserDefaults.standard.float(forKey: "microphoneVolume")
+        }
+        set {
+            withMutation(keyPath: \.microphoneVolume) {
+                UserDefaults.standard.set(newValue, forKey: "microphoneVolume")
+            }
+        }
+    }
+
+    var isSystemAudioMuted: Bool {
+        get {
+            access(keyPath: \.isSystemAudioMuted)
+            return UserDefaults.standard.bool(forKey: "isSystemAudioMuted")
+        }
+        set {
+            withMutation(keyPath: \.isSystemAudioMuted) {
+                UserDefaults.standard.set(newValue, forKey: "isSystemAudioMuted")
+            }
+        }
+    }
+
+    var isMicrophoneMuted: Bool {
+        get {
+            access(keyPath: \.isMicrophoneMuted)
+            return UserDefaults.standard.bool(forKey: "isMicrophoneMuted")
+        }
+        set {
+            withMutation(keyPath: \.isMicrophoneMuted) {
+                UserDefaults.standard.set(newValue, forKey: "isMicrophoneMuted")
+            }
+        }
+    }
+
+    // MARK: - Audio Processing Settings
+
+    var noiseReductionAmount: Float {
+        get {
+            access(keyPath: \.noiseReductionAmount)
+            return UserDefaults.standard.float(forKey: "noiseReductionAmount")
+        }
+        set {
+            withMutation(keyPath: \.noiseReductionAmount) {
+                UserDefaults.standard.set(newValue, forKey: "noiseReductionAmount")
+            }
+        }
+    }
+
+    var autoGainControlEnabled: Bool {
+        get {
+            access(keyPath: \.autoGainControlEnabled)
+            return UserDefaults.standard.bool(forKey: "autoGainControlEnabled")
+        }
+        set {
+            withMutation(keyPath: \.autoGainControlEnabled) {
+                UserDefaults.standard.set(newValue, forKey: "autoGainControlEnabled")
+            }
+        }
+    }
+
+    var compressionEnabled: Bool {
+        get {
+            access(keyPath: \.compressionEnabled)
+            return UserDefaults.standard.bool(forKey: "compressionEnabled")
+        }
+        set {
+            withMutation(keyPath: \.compressionEnabled) {
+                UserDefaults.standard.set(newValue, forKey: "compressionEnabled")
+            }
+        }
+    }
+
+    var enableMultiTrackOutput: Bool {
+        get {
+            access(keyPath: \.enableMultiTrackOutput)
+            return UserDefaults.standard.bool(forKey: "enableMultiTrackOutput")
+        }
+        set {
+            withMutation(keyPath: \.enableMultiTrackOutput) {
+                UserDefaults.standard.set(newValue, forKey: "enableMultiTrackOutput")
+            }
+        }
+    }
+
     // MARK: - Presenter Overlay Settings
 
     var presenterOverlayEnabled: Bool {
@@ -565,5 +665,18 @@ final class SettingsStore {
     /// Returns the full output URL for a new recording
     func generateOutputURL() -> URL {
         outputDirectory.appending(path: generateFilename())
+    }
+}
+
+// MARK: - AudioProcessingSettings Binding Extension
+
+extension AudioProcessingSettings {
+    var noiseReductionAmountBinding: Binding<Bool> {
+        Binding(
+            get: { noiseReductionAmount > 0 },
+            set: { newValue in
+                noiseReductionAmount = newValue ? 0.5 : 0
+            }
+        )
     }
 }

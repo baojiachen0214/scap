@@ -25,16 +25,19 @@ final class AssetWriter: CaptureEngineSampleBufferDelegate, @unchecked Sendable 
     private(set) var isWriting = false
     private(set) var outputURL: URL?
 
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "BetterCapture", category: "AssetWriter")
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "scap", category: "AssetWriter")
 
     // Track if we've received the first sample
     private var hasStartedSession = false
     private var sessionStartTime: CMTime = .zero
 
-    /// Last appended video presentation time — used to enforce monotonically
-    /// increasing timestamps and protect the writer from timing glitches that
-    /// occur when Presenter Overlay composites the camera into the stream.
+    /// Last appended video presentation time
     private var lastVideoPresentationTime: CMTime = .invalid
+
+    /// Track IDs for multi-track output
+    private var videoTrackID: Int32 = 1
+    private var systemAudioTrackID: Int32 = 2
+    private var microphoneTrackID: Int32 = 3
 
     // Lock for thread-safe access to writer state
     private let lock = OSAllocatedUnfairLock()
@@ -94,6 +97,7 @@ final class AssetWriter: CaptureEngineSampleBufferDelegate, @unchecked Sendable 
             let audioSettings = createAudioSettings(from: settings)
             audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             audioInput?.expectsMediaDataInRealTime = true
+            audioInput?.trackID = systemAudioTrackID
 
             if let audioInput, assetWriter.canAdd(audioInput) {
                 assetWriter.add(audioInput)
@@ -105,6 +109,7 @@ final class AssetWriter: CaptureEngineSampleBufferDelegate, @unchecked Sendable 
             let micSettings = createAudioSettings(from: settings)
             microphoneInput = AVAssetWriterInput(mediaType: .audio, outputSettings: micSettings)
             microphoneInput?.expectsMediaDataInRealTime = true
+            microphoneInput?.trackID = microphoneTrackID
 
             if let microphoneInput, assetWriter.canAdd(microphoneInput) {
                 assetWriter.add(microphoneInput)

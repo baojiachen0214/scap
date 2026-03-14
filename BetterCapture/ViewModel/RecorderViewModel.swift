@@ -80,7 +80,10 @@ final class RecorderViewModel {
     private let assetWriter: AssetWriter
     private let cameraSession = CameraSession()
 
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "BetterCapture", category: "RecorderViewModel")
+    /// Audio mixer for volume control and level metering
+    let audioMixer: AudioMixer
+
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "scap", category: "RecorderViewModel")
 
     // MARK: - Private Properties
 
@@ -101,6 +104,7 @@ final class RecorderViewModel {
         self.permissionService = PermissionService()
         self.captureEngine = CaptureEngine()
         self.assetWriter = AssetWriter()
+        self.audioMixer = AudioMixer(settingsStore: settings)
 
         captureEngine.delegate = self
         captureEngine.sampleBufferDelegate = assetWriter

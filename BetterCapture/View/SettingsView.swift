@@ -116,41 +116,48 @@ struct VideoSettingsView: View {
 
 struct AudioSettingsView: View {
     @Bindable var settings: SettingsStore
+    @State private var mixer = AudioMixer()
 
     var body: some View {
-        Form {
-            Section("Sources") {
-                Toggle("Capture System Audio", isOn: $settings.captureSystemAudio)
-                    .help("Record audio from applications and system sounds")
+        ScrollView {
+            VStack(spacing: 16) {
+                // Audio Control Panel with meters
+                AudioControlPanel(mixer: mixer, settings: settings)
 
-                Toggle("Capture Microphone", isOn: $settings.captureMicrophone)
-                    .help("Record audio from the default microphone input")
-            }
+                // Original audio settings
+                GroupBox("音频源") {
+                    Form {
+                        Toggle("捕获系统音频", isOn: $settings.captureSystemAudio)
+                            .help("录制应用程序和系统声音")
 
-            Section("Format") {
-                Picker("Codec", selection: $settings.audioCodec) {
-                    ForEach(AudioCodec.allCases) { codec in
-                        let isSupported = settings.containerFormat.supportedAudioCodecs.contains(codec)
-                        if isSupported {
-                            Text(codec.rawValue).tag(codec)
-                        } else {
-                            Text("\(codec.rawValue) (not supported for \(settings.containerFormat.rawValue.uppercased()))")
-                                .foregroundStyle(.secondary)
-                                .tag(codec)
+                        Toggle("捕获麦克风", isOn: $settings.captureMicrophone)
+                            .help("录制默认麦克风输入")
+
+                        Picker("音频编码", selection: $settings.audioCodec) {
+                            ForEach(AudioCodec.allCases) { codec in
+                                let isSupported = settings.containerFormat.supportedAudioCodecs.contains(codec)
+                                if isSupported {
+                                    Text(codec.rawValue).tag(codec)
+                                } else {
+                                    Text("\(codec.rawValue) (不支持 \(settings.containerFormat.rawValue.uppercased()))")
+                                        .foregroundStyle(.secondary)
+                                        .tag(codec)
+                                }
+                            }
                         }
+                        .help("AAC 是压缩格式，PCM 是无损未压缩（仅限 MOV）")
                     }
+                    .padding(.vertical, 8)
                 }
-                .help("AAC is compressed, PCM is uncompressed lossless (MOV only)")
-            }
 
-            Section {
-                Text("Audio tracks are recorded separately for post-processing flexibility.")
+                Text("音频轨道分别录制，方便后期处理。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
         .padding()
+        .frame(minWidth: 450, minHeight: 500)
     }
 }
 

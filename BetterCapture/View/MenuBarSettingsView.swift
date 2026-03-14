@@ -641,12 +641,197 @@ struct PresenterOverlaySettingsSection: View {
     }
 }
 
+// MARK: - Audio Control Panel Entry
+
+/// A compact audio control panel entry in the menu bar with level meters and volume sliders
+struct AudioControlPanelEntry: View {
+    @MainActor @Bindable var mixer: AudioMixer
+    @MainActor @Bindable var settings: SettingsStore
+    @State private var isExpanded = false
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Main row - click to expand
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    // Icon with indicator
+                    ZStack {
+                        Circle()
+                            .fill(.gray.opacity(0.2))
+                            .frame(width: 24, height: 24)
+
+                        Image(systemName: "waveform")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.primary)
+                    }
+
+                    Text("音频控制")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.primary)
+
+                    Spacer()
+
+                    // Chevron
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering in
+                isHovered = hovering
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(isHovered ? .gray.opacity(0.1) : .clear)
+                    .padding(.horizontal, 4)
+            )
+
+            // Expanded content
+            if isExpanded {
+                VStack(spacing: 8) {
+                    // Mini level meters
+                    HStack(spacing: 16) {
+                        MiniLevelMeter(
+                            level: mixer.levelMeter.currentLevels.systemAudioLevel,
+                            color: .blue,
+                            label: "系统音频"
+                        )
+
+                        MiniLevelMeter(
+                            level: mixer.levelMeter.currentLevels.microphoneLevel,
+                            color: .green,
+                            label: "麦克风"
+                        )
+                    }
+                    .padding(.horizontal, 12)
+
+                    // Volume sliders
+                    VStack(spacing: 6) {
+                        MiniVolumeSlider(
+                            volume: $mixer.systemAudioVolume,
+                            isMuted: $mixer.isSystemAudioMuted,
+                            label: "系统音频"
+                        )
+
+                        MiniVolumeSlider(
+                            volume: $mixer.microphoneVolume,
+                            isMuted: $mixer.isMicrophoneMuted,
+                            label: "麦克风"
+                        )
+                    }
+                    .padding(.horizontal, 12)
+
+                    // Audio effects toggles
+                    VStack(spacing: 4) {
+                        HStack {
+                            Toggle("降噪", isOn: .init(
+                                get: { settings.noiseReductionAmount > 0 },
+                                set: { newValue in
+                                    settings.noiseReductionAmount = newValue ? 0.5 : 0
+                                }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .scaleEffect(0.9)
+
+                            Toggle("自动增益", isOn: $settings.autoGainControlEnabled)
+                                .toggleStyle(.checkbox)
+                                .scaleEffect(0.9)
+
+                            Toggle("压缩", isOn: $settings.compressionEnabled)
+                                .toggleStyle(.checkbox)
+                                .scaleEffect(0.9)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
+                }
+                .padding(.vertical, 8)
+                .background(.quaternary.opacity(0.3))
+            }
+        }
+    }
+}
+
+// MARK: - Mini Level Meter
+
+struct MiniLevelMeter: View {
+    let level: Float
+    let color: Color
+    let label: String
+
+    @State private var displayLevel: Float = -60
+
+    var body: some View {
+        VStack(spacing: 4) {
+            // Level bar
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.gray.opacity(0.3))
+                        .frame(height: 8)
+
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(color)
+                        .frame(width: CGFloat(max(0, min(1, (displayLevel + 60) / 60))) * geometry.size.width, height: 8)
+                }
+            }
+            .frame(height: 8)
+            .onChange(of: level) { _, newLevel in
+                withAnimation(.easeOut(duration: 0.1)) {
+                    displayLevel = newLevel
+                }
+            }
+
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Mini Volume Slider
+
+struct MiniVolumeSlider: View {
+    @Binding var volume: Float
+    @Binding var isMuted: Bool
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: { isMuted.toggle() }) {
+                Image(systemName: isMuted || volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .foregroundStyle(volume == 0 ? .secondary : .primary)
+            }
+            .buttonStyle(.plain)
+
+            Slider(value: $volume, in: 0...1, step: 0.01)
+                .disabled(isMuted)
+
+            Text("\(Int(volume * 100))%")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 30)
+        }
+    }
+}
+
 // MARK: - Preview
 
 #Preview {
     VStack(spacing: 0) {
         VideoSettingsSection(settings: SettingsStore())
         PresenterOverlaySettingsSection(settings: SettingsStore(), cameraDeviceService: CameraDeviceService())
+        AudioControlPanelEntry(mixer: AudioMixer(), settings: SettingsStore())
         AudioSettingsSection(settings: SettingsStore(), audioDeviceService: AudioDeviceService())
     }
     .frame(width: 320)
