@@ -2,14 +2,38 @@
 //  CaptureEngine.swift
 //  BetterCapture
 //
-//  Created by Joshua Sattler on 29.01.26.
+//  修复版 - 解决录屏启动失败问题
 //
 
 import Foundation
 import ScreenCaptureKit
 import OSLog
 
-/// Delegate protocol for receiving capture events (non-sample buffer events)
+/// 捕获引擎错误
+enum CaptureError: LocalizedError {
+    case noContentFilterSelected
+    case screenRecordingPermissionDenied
+    case microphonePermissionDenied
+    case failedToCreateStream
+    case streamStartFailed(Error)
+    
+    var errorDescription: String? {
+        switch self {
+        case .noContentFilterSelected:
+            return "未选择录制内容"
+        case .screenRecordingPermissionDenied:
+            return "屏幕录制权限被拒绝"
+        case .microphonePermissionDenied:
+            return "麦克风权限被拒绝"
+        case .failedToCreateStream:
+            return "创建录制流失败"
+        case .streamStartFailed(let error):
+            return "启动录制失败: \(error.localizedDescription)"
+        }
+    }
+}
+
+/// 捕获引擎代理
 @MainActor
 protocol CaptureEngineDelegate: AnyObject {
     func captureEngine(_ engine: CaptureEngine, didUpdateFilter filter: SCContentFilter)
@@ -18,106 +42,100 @@ protocol CaptureEngineDelegate: AnyObject {
     func captureEngine(_ engine: CaptureEngine, presenterOverlayDidChange isActive: Bool)
 }
 
-/// Protocol for receiving sample buffers - called synchronously on capture queue
+/// 样本缓冲区代理
 protocol CaptureEngineSampleBufferDelegate: AnyObject, Sendable {
     nonisolated func captureEngine(_ engine: CaptureEngine, didOutputVideoSampleBuffer sampleBuffer: CMSampleBuffer)
     nonisolated func captureEngine(_ engine: CaptureEngine, didOutputAudioSampleBuffer sampleBuffer: CMSampleBuffer)
     nonisolated func captureEngine(_ engine: CaptureEngine, didOutputMicrophoneSampleBuffer sampleBuffer: CMSampleBuffer)
 }
 
-/// Service responsible for managing ScreenCaptureKit capture streams
+/// 修复后的捕获引擎
 @MainActor
 final class CaptureEngine: NSObject {
-
-    // MARK: - Properties
-
+    
     weak var delegate: CaptureEngineDelegate?
-
-    /// Sample buffer delegate - accessed from capture queue, hence nonisolated
-    /// The delegate must be set before starting capture and not changed during capture
-    nonisolated(unsafe) weak var sampleBufferDelegate: CaptureEngineSampleBufferDelegate?
-
+    
+    /// 样本缓冲区代理 - 在捕获队列上调用
+    weak var sampleBufferDelegate: CaptureEngineSampleBufferDelegate? {
+        didSet {
+            // 确保在设置代理时同步到捕获队列
+            videoSampleQueue.async { [weak self] in
+                self?.unsafeSampleBufferDelegate = oldValue
+            }
+        }
+    }
+    
+    /// 非隔离的代理引用 - 仅在捕获队列上使用
+    private nonisolated(unsafe) var unsafeSampleBufferDelegate: CaptureEngineSampleBufferDelegate?
+    
     private(set) var contentFilter: SCContentFilter?
     private(set) var isCapturing = false
     private(set) var isPresenterOverlayActive = false
-
+    
     private var stream: SCStream?
     private let picker = SCContentSharingPicker.shared
     private let contentFilterService = ContentFilterService()
-
+    
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "BetterCapture", category: "CaptureEngine")
-
-    // Queues for sample buffer handling
+    
+    // 样本缓冲区处理队列
     private let videoSampleQueue = DispatchQueue(label: "com.bettercapture.videoSampleQueue", qos: .userInteractive)
     private let audioSampleQueue = DispatchQueue(label: "com.bettercapture.audioSampleQueue", qos: .userInteractive)
     private let microphoneSampleQueue = DispatchQueue(label: "com.bettercapture.microphoneSampleQueue", qos: .userInteractive)
-
+    
     // MARK: - Initialization
-
+    
     override init() {
         super.init()
         setupPicker()
     }
-
+    
+    deinit {
+        picker.remove(self)
+    }
+    
     // MARK: - Picker Management
-
-    /// Sets up the content sharing picker
+    
     private func setupPicker() {
         picker.add(self)
-        // Don't activate picker at startup to avoid triggering camera indicator
-        // It will be activated when presentPicker() is called
-
+        
         var config = SCContentSharingPickerConfiguration()
         config.allowsChangingSelectedContent = true
-
-        // Enable all picker modes including display selection
         config.allowedPickerModes = [.singleDisplay, .singleWindow, .singleApplication]
-
-        // Exclude this app from capture
+        
         if let bundleID = Bundle.main.bundleIdentifier {
             config.excludedBundleIDs = [bundleID]
         }
-
+        
         picker.defaultConfiguration = config
     }
-
-    /// Presents the system content sharing picker
-    /// - Note: The picker window should appear above all other windows, but may sometimes
-    ///         appear behind the menu bar popover depending on window levels. If this occurs,
-    ///         the user can click outside the menu bar to dismiss it before presenting the picker.
+    
     func presentPicker() {
-        // Activate picker when it's actually needed
         picker.isActive = true
         picker.present()
     }
-
+    
     // MARK: - Stream Management
-
-    /// Starts capturing with the current content filter
-    /// - Parameters:
-    ///   - settings: The settings store containing capture configuration
-    ///   - videoSize: The dimensions for the captured video
-    ///   - sourceRect: Optional rectangle for area selection (display points, top-left origin)
+    
     func startCapture(with settings: SettingsStore, videoSize: CGSize, sourceRect: CGRect? = nil) async throws {
         guard let filter = contentFilter else {
             throw CaptureError.noContentFilterSelected
         }
-
-        // Check for screen recording permission before starting capture
+        
+        // 检查权限
         let hasPermission = contentFilterService.hasScreenRecordingPermission()
-        logger.info("Screen recording permission check: \(hasPermission)")
-
+        logger.info("屏幕录制权限检查: \(hasPermission)")
+        
         guard hasPermission else {
-            // Request permission - this will open the system prompt or System Settings
             contentFilterService.requestScreenRecordingPermission()
             throw CaptureError.screenRecordingPermissionDenied
         }
-
-        // Check for microphone permission if microphone capture is enabled
+        
+        // 检查麦克风权限
         if settings.captureMicrophone {
             let hasMicPermission = contentFilterService.hasMicrophonePermission()
-            logger.info("Microphone permission check: \(hasMicPermission)")
-
+            logger.info("麦克风权限检查: \(hasMicPermission)")
+            
             if !hasMicPermission {
                 let granted = await contentFilterService.requestMicrophonePermission()
                 if !granted {
@@ -125,171 +143,172 @@ final class CaptureEngine: NSObject {
                 }
             }
         }
-
-        // Apply content filter settings (wallpaper, dock, menu bar)
-        logger.info("Applying content filter settings...")
+        
+        // 应用内容过滤器设置
+        logger.info("应用内容过滤器设置...")
         let filteredContent = try await contentFilterService.applySettings(to: filter, settings: settings)
-        logger.info("Content filter applied, creating stream...")
-
+        logger.info("内容过滤器已应用")
+        
+        // 创建流配置
         let streamConfig = createStreamConfiguration(from: settings, contentSize: videoSize, sourceRect: sourceRect)
-
+        
+        // 创建流
         stream = SCStream(filter: filteredContent, configuration: streamConfig, delegate: self)
-
-        guard let stream else {
+        
+        guard let stream = stream else {
             throw CaptureError.failedToCreateStream
         }
-
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoSampleQueue)
-        logger.info("Added screen output")
-
-        if settings.captureSystemAudio {
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSampleQueue)
-            logger.info("Added system audio output")
+        
+        // 同步设置非隔离代理
+        self.unsafeSampleBufferDelegate = sampleBufferDelegate
+        
+        do {
+            // 添加视频输出
+            try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoSampleQueue)
+            logger.info("已添加屏幕输出")
+            
+            // 添加系统音频输出
+            if settings.captureSystemAudio {
+                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSampleQueue)
+                logger.info("已添加系统音频输出")
+            }
+            
+            // 添加麦克风输出
+            if settings.captureMicrophone {
+                try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: microphoneSampleQueue)
+                logger.info("已添加麦克风输出")
+            }
+            
+            // 启动捕获
+            logger.info("启动流捕获...")
+            try await stream.startCapture()
+            logger.info("流捕获启动成功")
+            
+            isCapturing = true
+            
+        } catch {
+            logger.error("启动捕获失败: \(error.localizedDescription)")
+            self.stream = nil
+            throw CaptureError.streamStartFailed(error)
         }
-
-        if settings.captureMicrophone {
-            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: microphoneSampleQueue)
-            logger.info("Added microphone output (device: \(settings.selectedMicrophoneID ?? "default"))")
-        }
-
-        logger.info("Stream config - capturesAudio: \(settings.captureSystemAudio), captureMicrophone: \(settings.captureMicrophone)")
-        logger.info("Starting stream capture...")
-        try await stream.startCapture()
-        logger.info("Stream capture started successfully")
-        isCapturing = true
-
-        logger.info("Capture started successfully")
     }
-
-    /// Stops the current capture stream
+    
     func stopCapture() async throws {
-        guard let stream, isCapturing else { return }
-
-        try await stream.stopCapture()
+        guard let stream = stream, isCapturing else {
+            logger.info("没有活动的捕获需要停止")
+            return
+        }
+        
+        do {
+            try await stream.stopCapture()
+            logger.info("流捕获已停止")
+        } catch {
+            logger.error("停止捕获失败: \(error.localizedDescription)")
+            throw error
+        }
+        
         self.stream = nil
         isCapturing = false
         isPresenterOverlayActive = false
-
-        logger.info("Capture stopped successfully")
     }
-
-    /// Updates the content filter for an active stream
+    
     func updateFilter(_ filter: SCContentFilter) async throws {
         contentFilter = filter
-
-        if let stream, isCapturing {
+        
+        if let stream = stream, isCapturing {
             try await stream.updateContentFilter(filter)
-            logger.info("Content filter updated")
+            logger.info("内容过滤器已更新")
         }
     }
-
+    
+    func clearSelection() {
+        contentFilter = nil
+    }
+    
+    func deactivatePicker() {
+        picker.isActive = false
+        logger.info("选择器已停用")
+    }
+    
     // MARK: - Configuration
-
-    /// Creates an SCStreamConfiguration from user settings
-    /// - Parameters:
-    ///   - settings: The settings store containing capture configuration
-    ///   - contentSize: The output dimensions for the captured video
-    ///   - sourceRect: Optional rectangle for area selection (display points, top-left origin)
+    
     private func createStreamConfiguration(from settings: SettingsStore, contentSize: CGSize, sourceRect: CGRect? = nil) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
-
-        // Set output dimensions - required for proper capture
+        
+        // 设置输出尺寸
         config.width = Int(contentSize.width)
         config.height = Int(contentSize.height)
-
-        // Set source rect for area selection (only works with display captures)
-        if let sourceRect {
+        
+        // 设置区域选择
+        if let sourceRect = sourceRect {
             config.sourceRect = sourceRect
-            logger.info("Source rect set: \(sourceRect.origin.x),\(sourceRect.origin.y) \(sourceRect.width)x\(sourceRect.height)")
+            logger.info("源矩形: \(sourceRect)")
         }
-
-        // Frame rate - native uses display sync (1/120 timescale)
+        
+        // 帧率
         if settings.frameRate == .native {
             config.minimumFrameInterval = CMTime(value: 1, timescale: 120)
         } else {
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(settings.frameRate.rawValue))
         }
-
-        // Cursor visibility
+        
+        // 光标可见性
         config.showsCursor = settings.showCursor
-
-        // System audio settings
+        
+        // 系统音频
         config.capturesAudio = settings.captureSystemAudio
         config.sampleRate = 48000
         config.channelCount = 2
-
-        // Microphone settings - requires full TCC screen recording permission
+        
+        // 麦克风
         config.captureMicrophone = settings.captureMicrophone
         if let microphoneID = settings.selectedMicrophoneID {
             config.microphoneCaptureDeviceID = microphoneID
         }
-
-        // Presenter Overlay: always show the alert so the user knows overlay is available
+        
+        // Presenter Overlay
         if settings.presenterOverlayEnabled {
             config.presenterOverlayPrivacyAlertSetting = .always
         }
-
-        // Configure pixel format and dynamic range based on HDR setting
+        
+        // HDR/像素格式
         if settings.captureHDR && settings.videoCodec.supportsHDR {
-            // HDR: Use 10-bit YCbCr format with HDR dynamic range
             config.pixelFormat = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             config.captureDynamicRange = .hdrLocalDisplay
         } else {
-            // SDR: Use 8-bit BGRA format
             config.pixelFormat = kCVPixelFormatType_32BGRA
             config.captureDynamicRange = .SDR
         }
-
+        
         return config
-    }
-
-    /// Clears the current content filter selection
-    func clearSelection() {
-        contentFilter = nil
-    }
-
-    /// Deactivates the content sharing picker to remove camera indicator
-    func deactivatePicker() {
-        picker.isActive = false
-        logger.info("Picker deactivated")
-    }
-
-    deinit {
-        picker.remove(self)
     }
 }
 
 // MARK: - SCContentSharingPickerObserver
 
 extension CaptureEngine: SCContentSharingPickerObserver {
-
+    
     nonisolated func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
         Task { @MainActor in
             self.contentFilter = filter
             self.delegate?.captureEngine(self, didUpdateFilter: filter)
-            logger.info("Content filter updated from picker")
-
-            // Deactivate picker after content selection to remove camera indicator
+            logger.info("内容过滤器已从选择器更新")
             picker.isActive = false
         }
     }
-
+    
     nonisolated func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
         Task { @MainActor in
-            // Clear the content filter when picker is cancelled or "Stop Sharing" is clicked
             self.contentFilter = nil
-
             self.delegate?.captureEngineDidCancelPicker(self)
-            logger.info("Picker cancelled, content filter cleared")
-
-            // Deactivate picker after cancellation to remove camera indicator
+            logger.info("选择器已取消")
             picker.isActive = false
         }
     }
-
-    nonisolated func contentSharingPickerStartDidFailWithError(_ error: any Error) {
+    
+    nonisolated func contentSharingPickerStartDidFailWithError(_ error: Error) {
         Task { @MainActor in
-            logger.error("Picker failed to start: \(error.localizedDescription)")
+            logger.error("选择器启动失败: \(error.localizedDescription)")
         }
     }
 }
@@ -297,29 +316,14 @@ extension CaptureEngine: SCContentSharingPickerObserver {
 // MARK: - SCStreamDelegate
 
 extension CaptureEngine: SCStreamDelegate {
-
-    nonisolated func stream(_ stream: SCStream, didStopWithError error: any Error) {
+    
+    func stream(_ stream: SCStream, didStopWithError error: Error?) {
+        logger.error("流停止，错误: \(error?.localizedDescription ?? "无")")
+        
         Task { @MainActor in
-            self.isCapturing = false
+            isCapturing = false
             self.stream = nil
-            self.delegate?.captureEngine(self, didStopWithError: error)
-            logger.error("Stream stopped with error: \(error.localizedDescription)")
-        }
-    }
-
-    nonisolated func outputVideoEffectDidStart(for stream: SCStream) {
-        Task { @MainActor in
-            self.isPresenterOverlayActive = true
-            self.delegate?.captureEngine(self, presenterOverlayDidChange: true)
-            logger.info("Presenter Overlay started")
-        }
-    }
-
-    nonisolated func outputVideoEffectDidStop(for stream: SCStream) {
-        Task { @MainActor in
-            self.isPresenterOverlayActive = false
-            self.delegate?.captureEngine(self, presenterOverlayDidChange: false)
-            logger.info("Presenter Overlay stopped")
+            delegate?.captureEngine(self, didStopWithError: error)
         }
     }
 }
@@ -327,46 +331,20 @@ extension CaptureEngine: SCStreamDelegate {
 // MARK: - SCStreamOutput
 
 extension CaptureEngine: SCStreamOutput {
-
+    
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard sampleBuffer.isValid else { return }
-
-        // Call sample buffer delegate synchronously on the capture queue
-        // to ensure the buffer remains valid during processing
+        // 使用非隔离代理
+        guard let delegate = unsafeSampleBufferDelegate else { return }
+        
         switch type {
         case .screen:
-            sampleBufferDelegate?.captureEngine(self, didOutputVideoSampleBuffer: sampleBuffer)
+            delegate.captureEngine(self, didOutputVideoSampleBuffer: sampleBuffer)
         case .audio:
-            sampleBufferDelegate?.captureEngine(self, didOutputAudioSampleBuffer: sampleBuffer)
+            delegate.captureEngine(self, didOutputAudioSampleBuffer: sampleBuffer)
         case .microphone:
-            sampleBufferDelegate?.captureEngine(self, didOutputMicrophoneSampleBuffer: sampleBuffer)
+            delegate.captureEngine(self, didOutputMicrophoneSampleBuffer: sampleBuffer)
         @unknown default:
             break
-        }
-    }
-}
-
-// MARK: - Errors
-
-enum CaptureError: LocalizedError {
-    case noContentFilterSelected
-    case failedToCreateStream
-    case captureAlreadyRunning
-    case screenRecordingPermissionDenied
-    case microphonePermissionDenied
-
-    var errorDescription: String? {
-        switch self {
-        case .noContentFilterSelected:
-            return "No content has been selected for capture. Please use the picker to select a window or display."
-        case .failedToCreateStream:
-            return "Failed to create the capture stream."
-        case .captureAlreadyRunning:
-            return "A capture session is already in progress."
-        case .screenRecordingPermissionDenied:
-            return "Screen recording permission is required. Please grant permission in System Settings → Privacy & Security → Screen Recording."
-        case .microphonePermissionDenied:
-            return "Microphone permission is required. Please grant permission in System Settings → Privacy & Security → Microphone."
         }
     }
 }

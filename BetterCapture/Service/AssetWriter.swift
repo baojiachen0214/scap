@@ -2,454 +2,429 @@
 //  AssetWriter.swift
 //  BetterCapture
 //
-//  Created by Joshua Sattler on 29.01.26.
+//  修复版 - 解决写入失败和线程安全问题
 //
 
 import Foundation
 import AVFoundation
 import ScreenCaptureKit
 import OSLog
-import os
 
-/// Service responsible for writing captured media to disk using AVAssetWriter
+/// AssetWriter 错误
+enum AssetWriterError: LocalizedError {
+    case failedToCreateWriter
+    case writerNotReady
+    case failedToStartWriting(Error?)
+    case noOutputURL
+    case noFramesWritten
+    case writingFailed(Error)
+    
+    var errorDescription: String? {
+        switch self {
+        case .failedToCreateWriter:
+            return "创建写入器失败"
+        case .writerNotReady:
+            return "写入器未就绪"
+        case .failedToStartWriting(let error):
+            return "开始写入失败: \(error?.localizedDescription ?? "未知错误")"
+        case .noOutputURL:
+            return "没有输出 URL"
+        case .noFramesWritten:
+            return "没有写入任何帧"
+        case .writingFailed(let error):
+            return "写入失败: \(error.localizedDescription)"
+        }
+    }
+}
+
+/// 负责将捕获的媒体写入磁盘
 final class AssetWriter: CaptureEngineSampleBufferDelegate, @unchecked Sendable {
-
+    
     // MARK: - Properties
-
+    
     private var assetWriter: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var audioInput: AVAssetWriterInput?
     private var microphoneInput: AVAssetWriterInput?
-
+    
     private(set) var isWriting = false
     private(set) var outputURL: URL?
-
-    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "scap", category: "AssetWriter")
-
-    // Track if we've received the first sample
+    
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "BetterCapture", category: "AssetWriter")
+    
     private var hasStartedSession = false
     private var sessionStartTime: CMTime = .zero
-
-    /// Last appended video presentation time
     private var lastVideoPresentationTime: CMTime = .invalid
-
-    /// Track IDs for multi-track output
+    
     private var videoTrackID: Int32 = 1
     private var systemAudioTrackID: Int32 = 2
     private var microphoneTrackID: Int32 = 3
-
-    // Lock for thread-safe access to writer state
-    private let lock = OSAllocatedUnfairLock()
-
+    
+    private let lock = NSLock()
+    
+    private var frameCount = 0
+    private var audioFrameCount = 0
+    
     // MARK: - Setup
-
-    /// Prepares the asset writer for recording
-    /// - Parameters:
-    ///   - url: The output file URL
-    ///   - settings: The settings store containing encoding configuration
-    ///   - videoSize: The dimensions of the video
+    
     func setup(url: URL, settings: SettingsStore, videoSize: CGSize) throws {
-        // Ensure output directory exists
+        lock.lock()
+        defer { lock.unlock() }
+        
+        // 确保输出目录存在
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        // Remove existing file if present
+        
+        // 删除已存在的文件
         if FileManager.default.fileExists(atPath: url.path()) {
             try FileManager.default.removeItem(at: url)
         }
-
-        // Create asset writer
-        let fileType = settings.containerFormat == .mov ? AVFileType.mov : AVFileType.mp4
+        
+        // 创建 AssetWriter
+        let fileType: AVFileType = settings.containerFormat == .mov ? .mov : .mp4
         assetWriter = try AVAssetWriter(outputURL: url, fileType: fileType)
-
-        guard let assetWriter else {
+        
+        guard let assetWriter = assetWriter else {
             throw AssetWriterError.failedToCreateWriter
         }
-
-        // Configure video input
+        
+        // 配置视频输入
         let videoSettings = createVideoSettings(from: settings, size: videoSize)
         videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoInput?.expectsMediaDataInRealTime = true
-
-        if let videoInput, assetWriter.canAdd(videoInput) {
+        
+        if let videoInput = videoInput, assetWriter.canAdd(videoInput) {
             assetWriter.add(videoInput)
-
-            // Create pixel buffer adaptor for appending raw pixel buffers from ScreenCaptureKit
-            // Use HDR 10-bit format when HDR is enabled with a compatible codec
+            
+            // 创建像素缓冲区适配器
             let pixelFormat: OSType = (settings.captureHDR && settings.videoCodec.supportsHDR)
                 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
                 : kCVPixelFormatType_32BGRA
-
+            
             let sourcePixelBufferAttributes: [String: Any] = [
                 kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
                 kCVPixelBufferWidthKey as String: Int(videoSize.width),
                 kCVPixelBufferHeightKey as String: Int(videoSize.height)
             ]
+            
             pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
                 assetWriterInput: videoInput,
                 sourcePixelBufferAttributes: sourcePixelBufferAttributes
             )
         }
-
-        // Configure audio input for system audio
+        
+        // 配置系统音频输入
         if settings.captureSystemAudio {
             let audioSettings = createAudioSettings(from: settings)
             audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             audioInput?.expectsMediaDataInRealTime = true
             audioInput?.trackID = systemAudioTrackID
-
-            if let audioInput, assetWriter.canAdd(audioInput) {
+            
+            if let audioInput = audioInput, assetWriter.canAdd(audioInput) {
                 assetWriter.add(audioInput)
             }
         }
-
-        // Configure microphone input as separate track
+        
+        // 配置麦克风输入
         if settings.captureMicrophone {
             let micSettings = createAudioSettings(from: settings)
             microphoneInput = AVAssetWriterInput(mediaType: .audio, outputSettings: micSettings)
             microphoneInput?.expectsMediaDataInRealTime = true
             microphoneInput?.trackID = microphoneTrackID
-
-            if let microphoneInput, assetWriter.canAdd(microphoneInput) {
+            
+            if let microphoneInput = microphoneInput, assetWriter.canAdd(microphoneInput) {
                 assetWriter.add(microphoneInput)
             }
         }
-
+        
         outputURL = url
         hasStartedSession = false
         sessionStartTime = .zero
         lastVideoPresentationTime = .invalid
         frameCount = 0
-
-        logger.info("AssetWriter configured for output: \(url.lastPathComponent)")
+        audioFrameCount = 0
+        
+        logger.info("AssetWriter 配置完成: \(url.lastPathComponent)")
     }
-
+    
     // MARK: - Writing
-
-    /// Starts the writing session
+    
     func startWriting() throws {
-        guard let assetWriter, assetWriter.status == .unknown else {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let assetWriter = assetWriter, assetWriter.status == .unknown else {
             throw AssetWriterError.writerNotReady
         }
-
+        
         guard assetWriter.startWriting() else {
             throw AssetWriterError.failedToStartWriting(assetWriter.error)
         }
-
+        
         isWriting = true
-        logger.info("AssetWriter started writing")
+        logger.info("AssetWriter 开始写入")
     }
-
-    // Track frame counts for debugging
-    private var frameCount = 0
-
-    /// Appends a video sample buffer - called synchronously from capture queue
-    func appendVideoSample(_ sampleBuffer: CMSampleBuffer) {
-        // Check frame status first - only process complete frames
+    
+    // MARK: - Sample Buffer Handling
+    
+    nonisolated func captureEngine(_ engine: CaptureEngine, didOutputVideoSampleBuffer sampleBuffer: CMSampleBuffer) {
+        // 检查帧状态
         guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[String: Any]],
               let attachments = attachmentsArray.first,
               let statusRawValue = attachments[SCStreamFrameInfo.status.rawValue] as? Int,
               let status = SCFrameStatus(rawValue: statusRawValue) else {
-            logger.warning("Could not extract frame status from sample buffer")
             return
         }
-
+        
         guard status == .complete else {
-            // Frame is not complete (idle, blank, etc.) - skip silently
             return
         }
-
-        lock.withLockUnchecked {
-            guard let assetWriter,
-                  assetWriter.status == .writing,
-                  let videoInput,
-                  videoInput.isReadyForMoreMediaData,
-                  let adaptor = pixelBufferAdaptor else {
+        
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let assetWriter = assetWriter,
+              assetWriter.status == .writing,
+              let videoInput = videoInput,
+              videoInput.isReadyForMoreMediaData,
+              let adaptor = pixelBufferAdaptor else {
+            return
+        }
+        
+        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        
+        // 在第一个样本上启动会话
+        if !hasStartedSession {
+            assetWriter.startSession(atSourceTime: presentationTime)
+            sessionStartTime = presentationTime
+            hasStartedSession = true
+            logger.info("会话在 \(presentationTime.seconds) 启动")
+        } else {
+            // 防止非单调时间戳
+            if lastVideoPresentationTime.isValid && presentationTime <= lastVideoPresentationTime {
                 return
-            }
-
-            let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-
-            // Start session on first sample
-            if !hasStartedSession {
-                assetWriter.startSession(atSourceTime: presentationTime)
-                sessionStartTime = presentationTime
-                hasStartedSession = true
-                logger.info("Session started at time: \(presentationTime.seconds)")
-            } else {
-                // Guard against non-monotonic timestamps. Presenter Overlay can
-                // cause timing glitches when compositing the camera into the
-                // stream; a single bad timestamp permanently fails the writer.
-                if lastVideoPresentationTime.isValid && presentationTime <= lastVideoPresentationTime {
-                    return
-                }
-            }
-
-            // Extract pixel buffer from sample buffer
-            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-                logger.warning("No image buffer in complete video frame")
-                return
-            }
-
-            // Append using the pixel buffer adaptor
-            if adaptor.append(pixelBuffer, withPresentationTime: presentationTime) {
-                lastVideoPresentationTime = presentationTime
-                frameCount += 1
-                if frameCount == 1 {
-                    logger.info("First video frame appended successfully")
-                }
-            } else {
-                if let error = assetWriter.error {
-                    logger.error("Failed to append video pixel buffer: \(error.localizedDescription)")
-                } else {
-                    logger.error("Failed to append video pixel buffer - no error available")
-                }
             }
         }
-    }
-
-    /// Appends a system audio sample buffer - called synchronously from capture queue
-    func appendAudioSample(_ sampleBuffer: CMSampleBuffer) {
-        lock.withLockUnchecked {
-            guard let assetWriter,
-                  assetWriter.status == .writing,
-                  let audioInput,
-                  audioInput.isReadyForMoreMediaData else {
-                return
+        
+        // 提取像素缓冲区
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return
+        }
+        
+        // 追加像素缓冲区
+        if adaptor.append(pixelBuffer, withPresentationTime: presentationTime) {
+            lastVideoPresentationTime = presentationTime
+            frameCount += 1
+            
+            if frameCount == 1 {
+                logger.info("第一帧视频追加成功")
+            } else if frameCount % 60 == 0 {
+                logger.debug("已写入 \(frameCount) 帧视频")
             }
-
-            let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-
-            // Start session on first sample if video hasn't started it yet
-            if !hasStartedSession {
-                assetWriter.startSession(atSourceTime: presentationTime)
-                sessionStartTime = presentationTime
-                hasStartedSession = true
-                logger.info("Session started at time: \(presentationTime.seconds)")
-            }
-
-            if !audioInput.append(sampleBuffer) {
-                logger.error("Failed to append audio sample buffer")
-            }
+        } else if let error = assetWriter.error {
+            logger.error("追加视频像素缓冲区失败: \(error.localizedDescription)")
         }
     }
-
-    /// Appends a microphone audio sample buffer
-    func appendMicrophoneSample(_ sampleBuffer: CMSampleBuffer) {
-        lock.withLockUnchecked {
-            guard let assetWriter,
-                  assetWriter.status == .writing,
-                  let microphoneInput,
-                  microphoneInput.isReadyForMoreMediaData else {
-                return
-            }
-
-            if !microphoneInput.append(sampleBuffer) {
-                logger.error("Failed to append microphone sample buffer")
-            }
+    
+    nonisolated func captureEngine(_ engine: CaptureEngine, didOutputAudioSampleBuffer sampleBuffer: CMSampleBuffer) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let assetWriter = assetWriter,
+              assetWriter.status == .writing,
+              let audioInput = audioInput,
+              audioInput.isReadyForMoreMediaData else {
+            return
+        }
+        
+        let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        
+        // 如果视频还没启动会话，用音频时间启动
+        if !hasStartedSession {
+            assetWriter.startSession(atSourceTime: presentationTime)
+            sessionStartTime = presentationTime
+            hasStartedSession = true
+            logger.info("会话从音频在 \(presentationTime.seconds) 启动")
+        }
+        
+        if audioInput.append(sampleBuffer) {
+            audioFrameCount += 1
+        } else {
+            logger.error("追加音频样本缓冲区失败")
         }
     }
-
+    
+    nonisolated func captureEngine(_ engine: CaptureEngine, didOutputMicrophoneSampleBuffer sampleBuffer: CMSampleBuffer) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let assetWriter = assetWriter,
+              assetWriter.status == .writing,
+              let microphoneInput = microphoneInput,
+              microphoneInput.isReadyForMoreMediaData else {
+            return
+        }
+        
+        if !microphoneInput.append(sampleBuffer) {
+            logger.error("追加麦克风样本缓冲区失败")
+        }
+    }
+    
     // MARK: - Finalization
-
-    /// Finishes writing and finalizes the output file
+    
     func finishWriting() async throws -> URL {
-        // First critical section: validate state and mark inputs as finished
+        // 第一阶段: 标记输入完成
         let (writerToFinish, url): (AVAssetWriter, URL)
-
+        
         do {
-            (writerToFinish, url) = try lock.withLockUnchecked {
-                guard let assetWriter, isWriting else {
-                    throw AssetWriterError.writerNotReady
-                }
-
-                guard let url = outputURL else {
-                    throw AssetWriterError.noOutputURL
-                }
-
-                logger.info("Finishing writing - status: \(assetWriter.status.rawValue), session started: \(self.hasStartedSession), frames written: \(self.frameCount)")
-
-                // Check if we actually started a session (received at least one frame)
-                guard hasStartedSession else {
-                    logger.error("No frames were written - session was never started")
-                    throw AssetWriterError.noFramesWritten
-                }
-
-                // Mark inputs as finished
-                videoInput?.markAsFinished()
-                audioInput?.markAsFinished()
-                microphoneInput?.markAsFinished()
-
-                return (assetWriter, url)
-            }
-        } catch AssetWriterError.noFramesWritten {
-            // Cancel needs to be called outside the lock since it acquires its own lock
-            cancel()
-            throw AssetWriterError.noFramesWritten
-        }
-
-        // Finish writing (outside lock since it's async)
-        await writerToFinish.finishWriting()
-
-        // Second critical section: check final status and cleanup
-        return try lock.withLockUnchecked {
-            guard let assetWriter else {
+            lock.lock()
+            
+            guard let assetWriter = assetWriter, isWriting else {
+                lock.unlock()
                 throw AssetWriterError.writerNotReady
             }
-
-            if assetWriter.status == .failed {
-                let error = assetWriter.error
-                logger.error("AssetWriter failed: \(error?.localizedDescription ?? "unknown error")")
-                throw AssetWriterError.writingFailed(error)
+            
+            guard let url = outputURL else {
+                lock.unlock()
+                throw AssetWriterError.noOutputURL
             }
-
-            isWriting = false
-            hasStartedSession = false
-            lastVideoPresentationTime = .invalid
-
-            logger.info("AssetWriter finished writing \(self.frameCount) frames to: \(url.lastPathComponent)")
-            frameCount = 0
-
-            // Clean up
-            self.assetWriter = nil
-            self.videoInput = nil
-            self.pixelBufferAdaptor = nil
-            self.audioInput = nil
-            self.microphoneInput = nil
-
-            return url
+            
+            logger.info("完成写入 - 状态: \(assetWriter.status.rawValue), 会话已启动: \(hasStartedSession), 视频帧: \(frameCount), 音频帧: \(audioFrameCount)")
+            
+            guard hasStartedSession else {
+                lock.unlock()
+                cancel()
+                throw AssetWriterError.noFramesWritten
+            }
+            
+            // 标记输入完成
+            videoInput?.markAsFinished()
+            audioInput?.markAsFinished()
+            microphoneInput?.markAsFinished()
+            
+            writerToFinish = assetWriter
+            self.outputURL = nil
+            
+            lock.unlock()
         }
-    }
-
-    /// Cancels the current writing session
-    func cancel() {
-        lock.withLockUnchecked {
-            assetWriter?.cancelWriting()
+        
+        // 第二阶段: 异步完成写入
+        await writerToFinish.finishWriting()
+        
+        // 第三阶段: 检查结果
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let url = outputURL ?? writerToFinish.outputURL else {
+            throw AssetWriterError.noOutputURL
+        }
+        
+        switch writerToFinish.status {
+        case .completed:
+            logger.info("写入完成: \(url.lastPathComponent), 共 \(frameCount) 帧视频, \(audioFrameCount) 帧音频")
+            
+            // 重置状态
             isWriting = false
-            hasStartedSession = false
-            lastVideoPresentationTime = .invalid
-            frameCount = 0
-
-            // Clean up temp file if it exists
-            if let url = outputURL {
-                try? FileManager.default.removeItem(at: url)
-            }
-
             assetWriter = nil
             videoInput = nil
             pixelBufferAdaptor = nil
             audioInput = nil
             microphoneInput = nil
-            outputURL = nil
-
-            logger.info("AssetWriter cancelled")
+            hasStartedSession = false
+            frameCount = 0
+            audioFrameCount = 0
+            
+            return url
+            
+        case .failed:
+            if let error = writerToFinish.error {
+                throw AssetWriterError.writingFailed(error)
+            } else {
+                throw AssetWriterError.writingFailed(NSError(domain: "AssetWriter", code: -1))
+            }
+            
+        case .cancelled:
+            throw AssetWriterError.writingFailed(NSError(domain: "AssetWriter", code: -2, userInfo: [NSLocalizedDescriptionKey: "写入被取消"]))
+            
+        default:
+            throw AssetWriterError.writingFailed(NSError(domain: "AssetWriter", code: -3, userInfo: [NSLocalizedDescriptionKey: "未知状态: \(writerToFinish.status.rawValue)"]))
         }
     }
-
-    // MARK: - Settings Helpers
-
+    
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        logger.info("取消写入")
+        
+        videoInput?.markAsFinished()
+        audioInput?.markAsFinished()
+        microphoneInput?.markAsFinished()
+        
+        assetWriter?.cancelWriting()
+        
+        // 清理状态
+        isWriting = false
+        assetWriter = nil
+        videoInput = nil
+        pixelBufferAdaptor = nil
+        audioInput = nil
+        microphoneInput = nil
+        hasStartedSession = false
+        frameCount = 0
+        audioFrameCount = 0
+    }
+    
+    // MARK: - Helper Methods
+    
     private func createVideoSettings(from settings: SettingsStore, size: CGSize) -> [String: Any] {
-        var videoSettings: [String: Any] = [
+        var settingsDict: [String: Any] = [
+            AVVideoCodecKey: settings.videoCodec.avCodecKey,
             AVVideoWidthKey: Int(size.width),
             AVVideoHeightKey: Int(size.height)
         ]
-
-        switch settings.videoCodec {
-        case .h264:
-            videoSettings[AVVideoCodecKey] = AVVideoCodecType.h264
-
-        case .hevc:
-            if settings.captureAlphaChannel {
-                videoSettings[AVVideoCodecKey] = AVVideoCodecType.hevcWithAlpha
-            } else {
-                videoSettings[AVVideoCodecKey] = AVVideoCodecType.hevc
-            }
-
-        case .proRes422:
-            videoSettings[AVVideoCodecKey] = AVVideoCodecType.proRes422
-
-        case .proRes4444:
-            videoSettings[AVVideoCodecKey] = AVVideoCodecType.proRes4444
-        }
-
-        // Add HDR color space settings for ProRes codecs with HDR enabled
-        if settings.captureHDR && settings.videoCodec.supportsHDR {
-            videoSettings[AVVideoColorPropertiesKey] = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+        
+        // ProRes 不使用压缩属性
+        if settings.videoCodec != .proRes422 && settings.videoCodec != .proRes4444 {
+            let compressionProperties: [String: Any] = [
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoMaxKeyFrameIntervalKey: settings.frameRate == .native ? 120 : settings.frameRate.rawValue * 2
             ]
+            settingsDict[AVVideoCompressionPropertiesKey] = compressionProperties
         }
-
-        return videoSettings
+        
+        return settingsDict
     }
-
+    
     private func createAudioSettings(from settings: SettingsStore) -> [String: Any] {
-        switch settings.audioCodec {
-        case .aac:
-            return [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: 48000,
-                AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 256000
-            ]
-
-        case .pcm:
-            return [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: 48000,
-                AVNumberOfChannelsKey: 2,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsFloatKey: false,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsNonInterleaved: false
-            ]
+        var settings: [String: Any] = [
+            AVFormatIDKey: settings.audioCodec == .aac ? kAudioFormatMPEG4AAC : kAudioFormatLinearPCM,
+            AVSampleRateKey: 48000,
+            AVNumberOfChannelsKey: 2
+        ]
+        
+        if settings.audioCodec == .aac {
+            settings[AVEncoderBitRateKey] = 128000
         }
+        
+        return settings
     }
 }
 
-// MARK: - CaptureEngineSampleBufferDelegate
+// MARK: - VideoCodec Extension
 
-extension AssetWriter {
-
-    func captureEngine(_ engine: CaptureEngine, didOutputVideoSampleBuffer sampleBuffer: CMSampleBuffer) {
-        appendVideoSample(sampleBuffer)
-    }
-
-    func captureEngine(_ engine: CaptureEngine, didOutputAudioSampleBuffer sampleBuffer: CMSampleBuffer) {
-        appendAudioSample(sampleBuffer)
-    }
-
-    func captureEngine(_ engine: CaptureEngine, didOutputMicrophoneSampleBuffer sampleBuffer: CMSampleBuffer) {
-        appendMicrophoneSample(sampleBuffer)
-    }
-}
-
-// MARK: - Errors
-
-enum AssetWriterError: LocalizedError {
-    case failedToCreateWriter
-    case writerNotReady
-    case failedToStartWriting(Error?)
-    case writingFailed(Error?)
-    case noOutputURL
-    case noFramesWritten
-
-    var errorDescription: String? {
+extension VideoCodec {
+    var avCodecKey: String {
         switch self {
-        case .failedToCreateWriter:
-            return "Failed to create the asset writer."
-        case .writerNotReady:
-            return "The asset writer is not ready for writing."
-        case .failedToStartWriting(let error):
-            return "Failed to start writing: \(error?.localizedDescription ?? "Unknown error")"
-        case .writingFailed(let error):
-            return "Writing failed: \(error?.localizedDescription ?? "Unknown error")"
-        case .noOutputURL:
-            return "No output URL was configured."
-        case .noFramesWritten:
-            return "No video frames were captured. Check screen recording permissions."
+        case .h264:
+            return AVVideoCodecType.h264.rawValue
+        case .hevc:
+            return AVVideoCodecType.hevc.rawValue
+        case .proRes422:
+            return AVVideoCodecType.proRes422.rawValue
+        case .proRes4444:
+            return AVVideoCodecType.proRes4444.rawValue
         }
     }
 }
