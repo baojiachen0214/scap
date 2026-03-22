@@ -1,0 +1,8 @@
+{
+    "version": "1.0.0",
+    "build": 1,
+    "minimumSystemVersion": "15.2",
+    "downloadURL": "https://github.com/baojiachen0214/scap/releases/download/v1.0.0/BetterCapture-1.0.0.dmg",
+    "releaseNotes": "Initial release with screen recording capabilities",
+    "releaseDate": "2026-03-22"
+}
